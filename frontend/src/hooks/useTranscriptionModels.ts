@@ -20,6 +20,15 @@ interface TranscriptModelConfig {
 }
 
 /**
+ * Server URL of the self-hosted Whisper server when it is the configured provider, else null.
+ * For `remoteWhisper` the config's `model` field holds the URL.
+ */
+export function getRemoteServerUrl(config: TranscriptModelConfig | undefined): string | null {
+  if (config?.provider !== 'remoteWhisper') return null;
+  return config.model?.trim() || null;
+}
+
+/**
  * Custom hook for fetching and managing transcription models (Whisper and Parakeet).
  *
  * This hook centralizes the model fetching logic that was previously duplicated

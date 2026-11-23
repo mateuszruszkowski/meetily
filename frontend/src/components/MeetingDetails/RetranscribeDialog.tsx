@@ -21,7 +21,7 @@ import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
 import { useConfig } from '@/contexts/ConfigContext';
 import { LANGUAGES } from '@/constants/languages';
-import { useTranscriptionModels, ModelOption } from '@/hooks/useTranscriptionModels';
+import { useTranscriptionModels, getRemoteServerUrl, ModelOption } from '@/hooks/useTranscriptionModels';
 import Analytics from '@/lib/analytics';
 
 interface RetranscribeDialogProps {
@@ -92,7 +92,8 @@ export function RetranscribeDialog({
     const name = selectedModelKey.slice(colonIndex + 1);
     return availableModels.find(m => m.provider === provider && m.name === name);
   }, [selectedModelKey, availableModels]);
-  const isParakeetModel = selectedModelDetails?.provider === 'parakeet';
+  const remoteServerUrl = getRemoteServerUrl(transcriptModelConfig);
+  const isParakeetModel = !remoteServerUrl && selectedModelDetails?.provider === 'parakeet';
 
   useEffect(() => {
     if (isParakeetModel && selectedLang !== 'auto') {
@@ -210,16 +211,16 @@ export function RetranscribeDialog({
       const languageToSend = isParakeetModel ? null : selectedLang === 'auto' ? null : selectedLang;
       await Analytics.track('enhance_transcript_started', {
         language: isParakeetModel ? 'auto' : (selectedLang === 'auto' ? 'auto' : selectedLang),
-        model_provider: selectedModelDetails?.provider || '',
-        model_name: selectedModelDetails?.name || ''
+        model_provider: remoteServerUrl ? 'remoteWhisper' : selectedModelDetails?.provider || '',
+        model_name: remoteServerUrl ? '' : selectedModelDetails?.name || ''
       });
 
       await invoke('start_retranscription_command', {
         meetingId,
         meetingFolderPath,
         language: languageToSend,
-        model: selectedModelDetails?.name || null,
-        provider: selectedModelDetails?.provider || null,
+        model: remoteServerUrl ?? (selectedModelDetails?.name || null),
+        provider: remoteServerUrl ? 'remoteWhisper' : selectedModelDetails?.provider || null,
       });
     } catch (err: any) {
       setIsProcessing(false);
@@ -336,7 +337,20 @@ export function RetranscribeDialog({
             )
           )}
 
-          {!isProcessing && !error && availableModels.length > 0 && (
+          {!isProcessing && !error && remoteServerUrl && (
+            <div className="space-y-3">
+              <div className="flex items-center gap-2">
+                <Cpu className="h-4 w-4 text-muted-foreground" />
+                <span className="text-sm font-medium">Remote Whisper server</span>
+              </div>
+              <p className="text-sm break-all rounded-md border bg-muted/40 px-3 py-2">{remoteServerUrl}</p>
+              <p className="text-xs text-muted-foreground">
+                Audio is sent to this server. Change it in transcription settings.
+              </p>
+            </div>
+          )}
+
+          {!isProcessing && !error && !remoteServerUrl && availableModels.length > 0 && (
             <div className="space-y-3">
               <div className="flex items-center gap-2">
                 <Cpu className="h-4 w-4 text-muted-foreground" />

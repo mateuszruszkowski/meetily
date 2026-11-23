@@ -36,7 +36,7 @@ import { useImportAudio, ImportResult } from '@/hooks/useImportAudio';
 import { useRouter } from 'next/navigation';
 import { useSidebar } from '../Sidebar/SidebarProvider';
 import { LANGUAGES } from '@/constants/languages';
-import { useTranscriptionModels, ModelOption } from '@/hooks/useTranscriptionModels';
+import { useTranscriptionModels, getRemoteServerUrl, ModelOption } from '@/hooks/useTranscriptionModels';
 
 
 interface ImportAudioDialogProps {
@@ -169,7 +169,8 @@ export function ImportAudioDialog({
     const name = selectedModelKey.slice(colonIndex + 1);
     return availableModels.find((m) => m.provider === provider && m.name === name);
   }, [selectedModelKey, availableModels]);
-  const isParakeetModel = selectedModel?.provider === 'parakeet';
+  const remoteServerUrl = getRemoteServerUrl(transcriptModelConfig);
+  const isParakeetModel = !remoteServerUrl && selectedModel?.provider === 'parakeet';
 
   useEffect(() => {
     if (isParakeetModel && selectedLang !== 'auto') {
@@ -191,8 +192,8 @@ export function ImportAudioDialog({
       fileInfo.path,
       title || fileInfo.filename,
       isParakeetModel ? null : selectedLang === 'auto' ? null : selectedLang,
-      selectedModel?.name || null,
-      selectedModel?.provider || null
+      remoteServerUrl ?? (selectedModel?.name || null),
+      remoteServerUrl ? 'remoteWhisper' : selectedModel?.provider || null
     );
   };
 
@@ -375,7 +376,20 @@ export function ImportAudioDialog({
                       )}
 
                       {/* Model selector */}
-                      {availableModels.length > 0 && (
+                      {remoteServerUrl && (
+                        <div className="space-y-2">
+                          <div className="flex items-center gap-2">
+                            <Cpu className="h-4 w-4 text-muted-foreground" />
+                            <span className="text-sm font-medium">Remote Whisper server</span>
+                          </div>
+                          <p className="text-sm break-all rounded-md border bg-muted/40 px-3 py-2">{remoteServerUrl}</p>
+                          <p className="text-xs text-muted-foreground">
+                            Audio is sent to this server. Change it in transcription settings.
+                          </p>
+                        </div>
+                      )}
+
+                      {!remoteServerUrl && availableModels.length > 0 && (
                         <div className="space-y-2">
                           <div className="flex items-center gap-2">
                             <Cpu className="h-4 w-4 text-muted-foreground" />
