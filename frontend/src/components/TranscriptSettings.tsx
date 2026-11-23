@@ -9,6 +9,8 @@ import { ModelManager } from './WhisperModelManager';
 import { ParakeetModelManager } from './ParakeetModelManager';
 
 
+const LOCAL_ASR_SERVER_URL = 'http://127.0.0.1:8892';
+
 export interface TranscriptModelProps {
     provider: 'localWhisper' | 'parakeet' | 'remoteWhisper' | 'deepgram' | 'elevenLabs' | 'groq' | 'openai';
     model: string;
@@ -37,6 +39,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
     const [serverUrlError, setServerUrlError] = useState<string | null>(null);
     const [healthCheckStatus, setHealthCheckStatus] = useState<'idle' | 'checking' | 'reachable' | 'unreachable' | 'error'>('idle');
     const [healthCheckError, setHealthCheckError] = useState<string | null>(null);
+    const [localServerDetected, setLocalServerDetected] = useState<boolean>(false);
 
     // Mirrors the latest transcriptModelConfig without pulling it into the
     // provider-switch effect's dependency array (same pattern as WhisperModelManager's autoSaveRef).
@@ -58,11 +61,30 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
             return;
         }
         const current = transcriptModelConfigRef.current;
-        setServerUrlDraft(current.provider === 'remoteWhisper' ? current.model : '');
+        const storedUrl = current.provider === 'remoteWhisper' ? current.model : '';
+        setServerUrlDraft(storedUrl);
         setServerUrlStatus('idle');
         setServerUrlError(null);
         setHealthCheckStatus('idle');
         setHealthCheckError(null);
+        setLocalServerDetected(false);
+        if (storedUrl) {
+            return;
+        }
+
+        let cancelled = false;
+        invoke<boolean>('remote_whisper_check_health', { baseUrl: LOCAL_ASR_SERVER_URL })
+            .then((reachable) => {
+                if (!reachable || cancelled) {
+                    return;
+                }
+                setServerUrlDraft((draft) => draft || LOCAL_ASR_SERVER_URL);
+                setLocalServerDetected(true);
+            })
+            .catch(() => {});
+        return () => {
+            cancelled = true;
+        };
     }, [uiProvider]);
 
     useEffect(() => {
@@ -317,7 +339,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                         void saveServerUrl();
                                     }
                                 }}
-                                placeholder="http://192.168.1.100:8093"
+                                placeholder={LOCAL_ASR_SERVER_URL}
                             />
 
                             <div className="mt-2 mx-1 flex items-center gap-2">
@@ -370,6 +392,11 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                     </p>
                                 )}
 
+                                {localServerDetected && !isServerUrlPersisted && trimmedServerUrl === LOCAL_ASR_SERVER_URL && (
+                                    <p className="flex items-center gap-1 text-xs text-green-600">
+                                        <CheckCircle2 className="h-3 w-3" /> Local ASR server detected on this Mac. Save to use it.
+                                    </p>
+                                )}
                                 {healthCheckStatus === 'reachable' && (
                                     <p className="flex items-center gap-1 text-xs text-green-600">
                                         <CheckCircle2 className="h-3 w-3" /> Server reachable
