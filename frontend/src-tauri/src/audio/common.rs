@@ -1,9 +1,14 @@
 use crate::api::TranscriptSegment;
-use anyhow::Result;
+use crate::audio::transcription::{RemoteWhisperProvider, TranscriptionProvider};
+use crate::parakeet_engine::ParakeetEngine;
+use crate::state::AppState;
+use crate::whisper_engine::WhisperEngine;
+use anyhow::{anyhow, Result};
 use log::{debug, info};
 use once_cell::sync::Lazy;
 use std::path::Path;
 use std::sync::Arc;
+use tauri::{AppHandle, Manager, Runtime};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use uuid::Uuid;
 
@@ -14,10 +19,119 @@ pub(crate) async fn acquire_engine_lifecycle_lock() -> OwnedMutexGuard<()> {
     ENGINE_LIFECYCLE_LOCK.clone().lock_owned().await
 }
 
-/// Unload the transcription engine after a batch job (import or retranscription).
+/// Which transcription backend a batch job (import or retranscription) uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchProvider {
+    Whisper,
+    Parakeet,
+    RemoteWhisper,
+}
+
+impl BatchProvider {
+    /// Parse the provider string sent by the frontend. Unknown or missing values mean local Whisper.
+    pub(crate) fn parse(provider: Option<&str>) -> Self {
+        match provider {
+            Some("parakeet") => Self::Parakeet,
+            Some("remoteWhisper") => Self::RemoteWhisper,
+            _ => Self::Whisper,
+        }
+    }
+}
+
+/// Engine a batch job transcribes its VAD segments with.
+pub(crate) enum BatchEngine {
+    Whisper(Arc<WhisperEngine>),
+    Parakeet(Arc<ParakeetEngine>),
+    Remote(Arc<dyn TranscriptionProvider>),
+}
+
+impl BatchEngine {
+    /// Build the remote engine from the command's `model` argument or the stored remote server URL.
+    pub(crate) async fn remote<R: Runtime>(app: &AppHandle<R>, model: Option<&str>) -> Result<Self> {
+        let stored = match model.map(str::trim).filter(|m| !m.is_empty()) {
+            Some(_) => None,
+            None => load_stored_transcript_settings(app).await?,
+        };
+        let base_url = resolve_remote_base_url(
+            model,
+            stored.as_ref().map(|(p, m)| (p.as_str(), m.as_str())),
+        )?;
+        info!("Using remote Whisper server at {} for batch transcription", base_url);
+        Ok(Self::Remote(Arc::new(RemoteWhisperProvider::new(base_url))))
+    }
+
+    /// Transcribe one segment of 16 kHz mono samples. Returns the text and the confidence, if the engine reports one.
+    pub(crate) async fn transcribe_segment(
+        &self,
+        index: usize,
+        samples: Vec<f32>,
+        language: Option<String>,
+    ) -> Result<(String, Option<f32>)> {
+        match self {
+            Self::Parakeet(engine) => {
+                let text = engine
+                    .transcribe_audio(samples)
+                    .await
+                    .map_err(|e| anyhow!("Parakeet transcription failed on segment {}: {}", index, e))?;
+                Ok((text, Some(0.9)))
+            }
+            Self::Whisper(engine) => {
+                let (text, conf, _) = engine
+                    .transcribe_audio_with_confidence(samples, language)
+                    .await
+                    .map_err(|e| anyhow!("Whisper transcription failed on segment {}: {}", index, e))?;
+                Ok((text, Some(conf)))
+            }
+            Self::Remote(provider) => {
+                let result = provider
+                    .transcribe(samples, language)
+                    .await
+                    .map_err(|e| anyhow!("Remote transcription failed on segment {}: {}", index, e))?;
+                Ok((result.text, result.confidence))
+            }
+        }
+    }
+}
+
+async fn load_stored_transcript_settings<R: Runtime>(
+    app: &AppHandle<R>,
+) -> Result<Option<(String, String)>> {
+    let app_state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| anyhow!("App state not available"))?;
+    sqlx::query_as("SELECT provider, model FROM transcript_settings WHERE id = '1'")
+        .fetch_optional(app_state.db_manager.pool())
+        .await
+        .map_err(|e| anyhow!("Failed to query transcript config: {}", e))
+}
+
+/// Resolve the remote server base URL: the explicit `model` argument wins, otherwise the stored
+/// `model` column when the stored provider is `remoteWhisper`.
+pub(crate) fn resolve_remote_base_url(
+    model_arg: Option<&str>,
+    stored: Option<(&str, &str)>,
+) -> Result<String> {
+    let explicit = model_arg.map(str::trim).filter(|m| !m.is_empty());
+    let stored_url = stored
+        .filter(|(provider, _)| *provider == "remoteWhisper")
+        .map(|(_, model)| model.trim())
+        .filter(|m| !m.is_empty());
+    explicit
+        .or(stored_url)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            anyhow!("No remote Whisper server URL configured. Set the server URL in transcription settings.")
+        })
+}
+
+/// Unload the local transcription engine after a batch job (import or retranscription).
 /// Skips unloading if a live recording is currently in progress, since recording
-/// uses the same global engine instances.
-pub(crate) async fn unload_engine_after_batch(use_parakeet: bool) {
+/// uses the same global engine instances. Remote jobs load nothing, so they unload nothing.
+pub(crate) async fn unload_engine_after_batch(provider: BatchProvider) {
+    if provider == BatchProvider::RemoteWhisper {
+        return;
+    }
+
     let _engine_lifecycle_guard = acquire_engine_lifecycle_lock().await;
 
     if crate::audio::recording_commands::is_recording().await {
@@ -25,7 +139,7 @@ pub(crate) async fn unload_engine_after_batch(use_parakeet: bool) {
         return;
     }
 
-    if use_parakeet {
+    if provider == BatchProvider::Parakeet {
         use crate::parakeet_engine::commands::PARAKEET_ENGINE;
         let engine = {
             let guard = PARAKEET_ENGINE.lock().unwrap_or_else(|e| e.into_inner());
@@ -232,5 +346,45 @@ mod tests {
 
         acquired_rx.await.unwrap();
         waiter.await.unwrap();
+    }
+
+    #[test]
+    fn batch_provider_parses_known_values_and_defaults_to_whisper() {
+        assert_eq!(BatchProvider::parse(Some("parakeet")), BatchProvider::Parakeet);
+        assert_eq!(BatchProvider::parse(Some("remoteWhisper")), BatchProvider::RemoteWhisper);
+        assert_eq!(BatchProvider::parse(Some("localWhisper")), BatchProvider::Whisper);
+        assert_eq!(BatchProvider::parse(Some("whisper")), BatchProvider::Whisper);
+        assert_eq!(BatchProvider::parse(Some("")), BatchProvider::Whisper);
+        assert_eq!(BatchProvider::parse(None), BatchProvider::Whisper);
+    }
+
+    #[test]
+    fn remote_base_url_prefers_explicit_argument() {
+        let url = resolve_remote_base_url(
+            Some(" http://a:1 "),
+            Some(("remoteWhisper", "http://b:2")),
+        )
+        .unwrap();
+        assert_eq!(url, "http://a:1");
+    }
+
+    #[test]
+    fn remote_base_url_falls_back_to_stored_remote_setting() {
+        for arg in [None, Some(""), Some("  ")] {
+            let url = resolve_remote_base_url(arg, Some(("remoteWhisper", "http://b:2"))).unwrap();
+            assert_eq!(url, "http://b:2");
+        }
+    }
+
+    #[test]
+    fn remote_base_url_ignores_stored_model_of_other_providers() {
+        let err = resolve_remote_base_url(None, Some(("localWhisper", "large-v3"))).unwrap_err();
+        assert!(err.to_string().contains("No remote Whisper server URL"));
+    }
+
+    #[test]
+    fn remote_base_url_errors_when_nothing_is_configured() {
+        assert!(resolve_remote_base_url(None, None).is_err());
+        assert!(resolve_remote_base_url(None, Some(("remoteWhisper", " "))).is_err());
     }
 }
